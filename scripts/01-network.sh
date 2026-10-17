@@ -3,6 +3,10 @@
 set -euo pipefail
 source "$(dirname "$0")/config.env"
 
+echo "region: $(aws configure get region) / $AWS_REGION"
+EXISTING=$(aws ec2 describe-vpcs --filters "Name=tag:Name,Values=$PROJECT-vpc" --query 'Vpcs[0].VpcId' --output text)
+[ "$EXISTING" = "None" ] || { echo "VPC $EXISTING already exists - run teardown/01-undo-network.sh first"; exit 1; }
+
 VPC_ID=$(aws ec2 create-vpc --cidr-block $VPC_CIDR \
   --tag-specifications "ResourceType=vpc,Tags=[{Key=Name,Value=$PROJECT-vpc}]" \
   --query Vpc.VpcId --output text)
