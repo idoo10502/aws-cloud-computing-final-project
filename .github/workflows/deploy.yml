@@ -1,0 +1,103 @@
+name: deploy
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  id-token: write    # required for OIDC
+  contents: read
+
+concurrency: deploy-main   # never two deploys at once
+
+jobs:
+  changes:
+    runs-on: ubuntu-latest
+    outputs:
+      visits:   ${{ steps.filter.outputs.visits }}
+      stats:    ${{ steps.filter.outputs.stats }}
+      frontend: ${{ steps.filter.outputs.frontend }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dorny/paths-filter@v3
+        id: filter
+        with:
+          filters: |
+            visits:   'workloads/visits-service/**'
+            stats:    'workloads/stats-service/**'
+            frontend: 'workloads/frontend/**'
+      - name: Summary
+        run: |
+          echo "visits=${{ steps.filter.outputs.visits }}" >> $GITHUB_STEP_SUMMARY
+          echo "stats=${{ steps.filter.outputs.stats }}" >> $GITHUB_STEP_SUMMARY
+          echo "frontend=${{ steps.filter.outputs.frontend }}" >> $GITHUB_STEP_SUMMARY
+
+  visits-service:
+    needs: changes
+    if: needs.changes.outputs.visits == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+      - name: Build & push
+        run: |
+          IMAGE=${{ steps.ecr.outputs.registry }}/final-project-visits-service:${{ github.sha }}
+          docker build -t "$IMAGE" workloads/visits-service
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+      - name: Deploy via SSM
+        env:
+          ALLOWED_ORIGIN: http://${{ vars.CF_DOMAIN }}
+          DB_HOST:  ${{ vars.DB_HOST }}
+          DB_NAME:  ${{ vars.DB_NAME }}
+          DB_USER:  ${{ vars.DB_USER }}
+          DB_PARAM: ${{ vars.DB_PARAM }}
+        run: bash scripts/ssm-deploy.sh visits "$IMAGE" ${{ vars.VISITS_INSTANCE_ID }}
+
+  stats-service:
+    needs: changes
+    if: needs.changes.outputs.stats == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - uses: aws-actions/amazon-ecr-login@v2
+        id: ecr
+      - name: Build & push
+        run: |
+          IMAGE=${{ steps.ecr.outputs.registry }}/final-project-stats-service:${{ github.sha }}
+          docker build -t "$IMAGE" workloads/stats-service
+          docker push "$IMAGE"
+          echo "IMAGE=$IMAGE" >> "$GITHUB_ENV"
+      - name: Deploy via SSM
+        env:
+          ALLOWED_ORIGIN: http://${{ vars.CF_DOMAIN }}
+          VISITS_PRIVATE_IP: ${{ vars.VISITS_PRIVATE_IP }}
+        run: bash scripts/ssm-deploy.sh stats "$IMAGE" ${{ vars.STATS_INSTANCE_ID }}
+
+  frontend:
+    needs: changes
+    if: needs.changes.outputs.frontend == 'true'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: aws-actions/configure-aws-credentials@v4
+        with:
+          role-to-assume: ${{ vars.AWS_ROLE_ARN }}
+          aws-region: ${{ vars.AWS_REGION }}
+      - name: Inject ALB URL
+        run: |
+          sed -i "s|__API_BASE_URL__|http://${{ vars.ALB_DNS }}|" workloads/frontend/index.html
+          ! grep -q __API_BASE_URL__ workloads/frontend/index.html
+      - name: Sync to S3
+        run: aws s3 sync workloads/frontend/ s3://${{ vars.S3_BUCKET }}/ --delete
+      - name: Invalidate CloudFront
+        run: aws cloudfront create-invalidation --distribution-id ${{ vars.CF_DIST_ID }} --paths '/*'
