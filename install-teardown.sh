@@ -35,14 +35,17 @@ __EOF__
 cat > scripts/teardown/01-undo-network.sh <<'__EOF__'
 #!/usr/bin/env bash
 # undoes 01-network.sh : NAT, Elastic IP, route tables, subnets, IGW, VPC.
-# Works from what actually exists in the VPC, so it also cleans partial runs.
+# Handles EVERY VPC tagged $PROJECT-vpc (duplicates from repeated runs) and partial runs.
 source "$(dirname "$0")/_lib.sh"
-VPC=${VPC_ID:-$(aws ec2 describe-vpcs --filters "Name=tag:Name,Values=$PROJECT-vpc" --query 'Vpcs[0].VpcId' --output text 2>/dev/null)}
-if [ -z "$VPC" ] || [ "$VPC" = "None" ]; then echo "   no VPC found - checking only for leftover Elastic IPs"; fi
+ALL_OK=1
+VPCS=$( { echo "${VPC_ID:-}"; aws ec2 describe-vpcs --filters "Name=tag:Name,Values=$PROJECT-vpc" --query 'Vpcs[].VpcId' --output text; } | tr '\t ' '\n\n' | grep '^vpc-' | sort -u)
+[ -z "$VPCS" ] && echo "   no project VPC found"
 
-if [ -n "$VPC" ] && [ "$VPC" != "None" ]; then
-  say "NAT gateways (the expensive one)"
+for VPC in $VPCS; do
+  say "VPC $VPC"
+  EIPS=""
   for nat in $(aws ec2 describe-nat-gateways --filter "Name=vpc-id,Values=$VPC" "Name=state,Values=pending,available" --query 'NatGateways[].NatGatewayId' --output text); do
+    EIPS="$EIPS $(aws ec2 describe-nat-gateways --nat-gateway-ids "$nat" --query 'NatGateways[0].NatGatewayAddresses[].AllocationId' --output text)"
     try aws ec2 delete-nat-gateway --nat-gateway-id "$nat"
   done
   echo "   waiting for NAT deletion..."
@@ -50,37 +53,26 @@ if [ -n "$VPC" ] && [ "$VPC" != "None" ]; then
     left=$(aws ec2 describe-nat-gateways --filter "Name=vpc-id,Values=$VPC" "Name=state,Values=pending,available,deleting" --query 'length(NatGateways)' --output text)
     [ "$left" = "0" ] && break; sleep 15
   done
-fi
+  for a in $EIPS; do retry 6 aws ec2 release-address --allocation-id "$a" && echo "   released EIP $a"; done
 
-say "Elastic IPs"
-for a in ${EIP_ALLOC:-} $(aws ec2 describe-addresses --query 'Addresses[?AssociationId==null].AllocationId' --output text 2>/dev/null); do
-  retry 4 aws ec2 release-address --allocation-id "$a" && echo "   released $a" || true
-done
-
-if [ -n "$VPC" ] && [ "$VPC" != "None" ]; then
-  say "route tables"
   for rt in $(aws ec2 describe-route-tables --filters "Name=vpc-id,Values=$VPC" --query 'RouteTables[?length(Associations[?Main==`true`])==`0`].RouteTableId' --output text); do
     for assoc in $(aws ec2 describe-route-tables --route-table-ids "$rt" --query 'RouteTables[0].Associations[].RouteTableAssociationId' --output text); do
       try aws ec2 disassociate-route-table --association-id "$assoc"
     done
     try aws ec2 delete-route-table --route-table-id "$rt"
   done
-  say "subnets"
   for s in $(aws ec2 describe-subnets --filters "Name=vpc-id,Values=$VPC" --query 'Subnets[].SubnetId' --output text); do
-    retry 6 aws ec2 delete-subnet --subnet-id "$s" && echo "   ok: $s" || echo "   FAILED: $s (ENI still attached - rerun in a few minutes)"
+    retry 6 aws ec2 delete-subnet --subnet-id "$s" && echo "   ok subnet $s" || { echo "   FAILED subnet $s"; ALL_OK=0; }
   done
-  say "internet gateway"
   for igw in $(aws ec2 describe-internet-gateways --filters "Name=attachment.vpc-id,Values=$VPC" --query 'InternetGateways[].InternetGatewayId' --output text); do
     try aws ec2 detach-internet-gateway --internet-gateway-id "$igw" --vpc-id "$VPC"
     try aws ec2 delete-internet-gateway --internet-gateway-id "$igw"
   done
-  say "VPC"
-  if retry 6 aws ec2 delete-vpc --vpc-id "$VPC"; then
-    echo "   ok: $VPC"; rm -f "$S_DIR/state.env" && echo "   state.env removed"
-  else
-    echo "   FAILED: VPC still has dependencies (check security groups / ENIs), state.env kept"
-  fi
-fi
+  if retry 6 aws ec2 delete-vpc --vpc-id "$VPC"; then echo "   ok VPC $VPC"
+  else echo "   FAILED VPC $VPC (leftover security groups / ENIs - run 02-undo-security-groups.sh, then rerun)"; ALL_OK=0; fi
+done
+[ "$ALL_OK" = 1 ] && rm -f "$S_DIR/state.env" && echo "   state.env removed"
+exit 0
 __EOF__
 cat > scripts/teardown/02-undo-security-groups.sh <<'__EOF__'
 #!/usr/bin/env bash
